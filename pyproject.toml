@@ -9,7 +9,7 @@ description = "A tmux-native control desk for mixed AI coding agents (Claude Cod
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "jefftko" }]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 keywords = ["tmux", "claude-code", "codex", "ai-agents", "cli"]
 classifiers = [
   "Environment :: Console",

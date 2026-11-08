@@ -28,7 +28,7 @@ pipx install git+https://github.com/jefftko/panepost   # or: pip install --user 
 ag tmux-snippet >> ~/.tmux.conf && tmux source-file ~/.tmux.conf
 ```
 
-Requirements: Python ≥ 3.9, tmux ≥ 3.2 (popups), [fzf](https://github.com/junegunn/fzf) for the pickers.
+Requirements: Python ≥ 3.10, tmux ≥ 3.2 (popups), [fzf](https://github.com/junegunn/fzf) for the pickers.
 
 Optional — let Codex sessions register their thread id (more reliable than reading the footer):
 `ag codex-hook-snippet` prints a `~/.codex/hooks.json` fragment to merge by hand.
