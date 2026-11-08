@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "panepost"
+version = "0.0.1"
+description = "A tmux-native control desk for mixed AI coding agents (Claude Code, Codex, opencode): list them, see who is waiting for you, message each other safely, restore after reboot."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "jefftko" }]
+requires-python = ">=3.9"
+keywords = ["tmux", "claude-code", "codex", "ai-agents", "cli"]
+classifiers = [
+  "Environment :: Console",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+]
+
+[project.urls]
+Homepage = "https://github.com/jefftko/panepost"
+
+[project.scripts]
+ag = "panepost.cli:main"
+panepost = "panepost.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
