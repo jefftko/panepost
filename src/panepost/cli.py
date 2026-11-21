@@ -3,8 +3,8 @@
   ag ls [filter] [-t] [--json]   list agents grouped by tmux session; -t = flat, most recent first
   ag send [--dry-run] <target> <message>
                                  deliver without interrupting: Codex via native `codex queue`,
-                                 others via tmux (refused if the input box holds a draft)
-  ag me [--pane %N] [--copy]     this pane's reply line:  ag send %12 "…"   # claude api @ tmux work:1.2
+                                 others via tmux when the idle input box can be verified
+  ag me [--pane %N] [--copy]     this pane's reply line:  ag send %12 "…"   # claude work:api(1)-2(%12) · API review
   ag cp <target> [send|id|pane|addr|resume|cwd|name]   copy to clipboard (default: send line)
   ag go <target>                 select that pane (and raise its terminal window when possible)
   ag new <dir> [--agent claude|codex|shell] [--session S] [--name N] [--go]
@@ -20,11 +20,11 @@
   ag hook codex <Event>          Codex hook entry: records pane <-> thread id (silent, never fails)
   ag --version
 
-Targets: alias, %pane, session:window[.pane], session-id prefix (>=8), agent name, window name,
+Targets: alias, %pane, session:window[.pane], session:window_name(index)-pane, session-id prefix (>=8), agent name, window name,
 or a unique substring. A pasted `ag send X "…"  # …` line works as a target too.
 Metadata only: never reads conversation content or credentials.
 """
-import datetime, glob, hashlib, json, os, platform, re, shlex, shutil, sqlite3, subprocess, sys, time, unicodedata
+import datetime, fcntl, glob, hashlib, json, os, platform, re, shlex, shutil, sqlite3, subprocess, sys, time, unicodedata
 
 from . import __version__
 
@@ -53,6 +53,7 @@ SNAPS = os.path.join(STATE, "snapshots")
 HOOKLOG = os.path.join(STATE, "codex-hooks.jsonl")
 ALIASES = os.path.join(STATE, "aliases.json")
 SENT = os.path.join(STATE, "sent.jsonl")
+SENT_MAX_BYTES, SENT_KEEP_LINES = 8 * 1024 * 1024, 20000
 PINS = os.path.join(STATE, "projects.json")
 CREATED = os.path.join(STATE, "created.jsonl")
 CLAUDE_SESS = os.path.join(H, ".claude/sessions")
@@ -62,6 +63,12 @@ BUSY_RE = re.compile(r"esc to interrupt|Working \(|Thinking…|Reviewing approva
 WAIT_RE = re.compile(r"Do you want to (proceed|make this edit|create)|Would you like to (run|make|apply|allow)|"
                      r"Enter to select|Esc to cancel|Press enter to confirm|Yes, and don't ask again|"
                      r"Allow (once|always)|requires approval")
+ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07")
+PROMPTS = {"codex": "›", "claude": "❯", "agy": ">"}
+BOX_RULE = re.compile(r"[─━]{3,}")
+AGY_MENU = re.compile(r"^\s*(?:Run this command\?|Allow access to this file\?|Requested Permission \(Editable\))\s*$|"
+                      r"^\s*(?:↑/↓[ \t]+Navigate|enter confirm[ \t]+·[ \t]+esc back).*?$", re.M)
+AGY_BUSY = re.compile(r"\besc to cancel\b|[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣻]\s*(?:Running|Thinking|Working)", re.I)
 SEP = "\t"
 CODEX_CFG = CFG.get("codex", {}) if isinstance(CFG.get("codex"), dict) else {}
 AGENT_CMDS = {"claude": "claude", "codex": "codex"}
@@ -107,6 +114,25 @@ def append_jsonl(path, obj):
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     with os.fdopen(fd, "a") as f:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+def record_send(obj):
+    """Serialize append and rotation so another sender's receipt is retained."""
+    os.makedirs(os.path.dirname(SENT), mode=0o700, exist_ok=True)
+    fd = os.open(SENT + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "r+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        append_jsonl(SENT, obj)
+        if os.path.getsize(SENT) <= SENT_MAX_BYTES:
+            return
+        with open(SENT, "rb") as f:
+            f.seek(-SENT_MAX_BYTES, os.SEEK_END)
+            f.readline()
+            lines = f.readlines()[-SENT_KEEP_LINES:]
+        tmp = "%s.tmp.%d" % (SENT, os.getpid())
+        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as f:
+            f.writelines(lines)
+        os.replace(tmp, SENT)
 
 
 # ---------------------------------------------------------------- discovery
@@ -185,32 +211,58 @@ def visible_undimmed(raw):
     return False
 
 
-def parse_ui(raw, kind):
-    """(busy, draft, footer, waiting) from the captured bottom of a pane (with escapes)."""
-    lines = [l for l in raw.splitlines() if l.strip()][-14:]
-    plain = [re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07", "", l) for l in lines]
-    busy = bool(BUSY_RE.search("\n".join(plain)))
-    waiting = bool(WAIT_RE.search("\n".join(plain[-10:])))
-    prompt = "›" if kind == "codex" else "❯" if kind == "claude" else None
-    draft = None
-    if prompt:
-        for raw_l, pl in reversed(list(zip(lines, plain))):
-            if pl.lstrip().startswith(prompt):
-                k = raw_l.find(prompt)
-                draft = visible_undimmed(raw_l[k + len(prompt):])
-                break
+def footer_start(line):
+    return " · " in line and ("~/" in line or " /" in line)
+
+
+def input_rows(lines, plain, kind):
+    """Return visible input rows only when the prompt and its box can be located."""
+    marker = PROMPTS.get(kind)
+    if marker is None:
+        return None
+    for i in range(len(plain) - 1, -1, -1):
+        text = plain[i].lstrip()
+        if text != marker and not text.startswith(marker + " "):
+            continue
+        if kind in ("claude", "agy") and (i == 0 or not BOX_RULE.fullmatch(plain[i-1].strip())):
+            return None
+        for end in range(i + 1, len(plain)):
+            if BOX_RULE.fullmatch(plain[end].strip()) or (kind == "codex" and footer_start(plain[end])):
+                first = lines[i].partition(marker)[2]
+                return [first, *lines[i+1:end]]
+        return None
+    return None
+
+
+def inspect_ui(raw, kind):
+    lines = [line for line in raw.splitlines() if ANSI.sub("", line).strip()][-24:]
+    plain = [ANSI.sub("", line) for line in lines]
+    tail = "\n".join(plain[-10:])
+    waiting = bool(AGY_MENU.search(tail) if kind == "agy" else WAIT_RE.search(tail))
+    busy = bool(BUSY_RE.search(tail) or (kind == "agy" and not waiting and AGY_BUSY.search(tail)))
+    rows = input_rows(lines, plain, kind)
     footer = ""
     if kind == "codex":
-        for pl in reversed(plain):
-            if " · " in pl and ("~/" in pl or " /" in pl):
-                footer = pl.strip()
+        for i in range(len(plain) - 1, -1, -1):
+            if footer_start(plain[i]):
+                footer = plain[i].strip()
+                for continuation in plain[i+1:i+3]:
+                    if continuation.lstrip().startswith(("← for agents", "? for shortcuts")):
+                        break
+                    footer += continuation.strip()
                 break
-    return busy, draft, footer, waiting
+    return busy, rows, footer, waiting
+
+
+def parse_ui(raw, kind):
+    """(busy, draft, footer, waiting) from the captured bottom of a pane."""
+    busy, rows, footer, waiting = inspect_ui(raw, kind)
+    return busy, any(map(visible_undimmed, rows)) if rows is not None else None, footer, waiting
 
 
 def pane_ui(pane_id, kind):
-    rc, raw, _ = sh(["tmux", "capture-pane", "-e", "-p", "-t", pane_id])
-    return parse_ui(raw, kind)
+    rc, raw, _ = sh(["tmux", "capture-pane", "-e", "-p", "-J", "-t", pane_id])
+    return parse_ui(raw if rc == 0 else "", kind)
 
 
 def claude_sessions():
@@ -273,19 +325,26 @@ def codex_hook_map(procs):
 
 def match_codex_footer(footer, cwd, threads):
     """Codex footer: 'model · <cwd> · <thread name> · …' -> (thread, source)."""
-    parts = [p.strip() for p in footer.split(" · ")]
+    parts = re.split(r"\s*·\s*", footer)
     if len(parts) < 3:
         return None, "unknown"
-    label = parts[2]
-    path = parts[1].replace("~", H, 1) if parts[1].startswith("~") else parts[1]
-    if label.endswith("…"):  # truncated: prefix match
-        pre = label[:-1].strip()
-        cands = [t for t in threads.values() if pre and (t["name"].startswith(pre) or t["title"].startswith(pre))]
-    else:
-        cands = [t for t in threads.values() if label and (t["name"] == label or t["title"] == label)]
-    if "…" not in path:
-        same = [t for t in cands if t["cwd"] == path or t["cwd"] == cwd]
-        cands = same or cands
+    # Narrow panes can wrap in the middle of a word or at a space.
+    def compact(value):
+        return re.sub(r"\s+", "", value or "")
+
+    labels = {compact(parts[2]), compact("·".join(parts[2:]))} - {""}
+    cands = [t for t in threads.values() if any(
+        name and (name.startswith(label[:-1]) if label.endswith("…") and len(label) > 1 else name == label)
+        for label in labels for name in (compact(t["name"]), compact(t["title"])))]
+    path = os.path.expanduser(parts[1])
+    full_path = path.startswith("/") and "…" not in path
+    # The pane cwd can recover a space lost when its displayed path wrapped.
+    directory = path if full_path and compact(path) != compact(cwd) else cwd
+    same = [t for t in cands if directory and t["cwd"] == directory]
+    if same or full_path:
+        cands = same
+    elif len(cands) == 1:
+        return None, "unknown"
     if len(cands) == 1:
         return cands[0], "footer"
     if cands:
@@ -412,7 +471,8 @@ def resolve(target, reg, depth=0):
     t = target.lower()
     tests = [
         lambda p: p["pane_id"] == target,
-        lambda p: p["addr"] == target or "%s:%s" % (p["session"], p["window"]) == target,
+        lambda p: p["addr"] == target or "%s:%s" % (p["session"], p["window"]) == target
+        or display_address(p) == target,
         lambda p: p.get("id") and len(target) >= 8 and p["id"].startswith(target),
         lambda p: (p.get("name") or "").lower() == t,
         lambda p: p["window_name"].lower() == t,
@@ -450,15 +510,29 @@ def me(reg):
     return hits[0] if len(hits) == 1 else None
 
 
+def label_text(value):
+    """Keep externally supplied titles on one line inside the ag header."""
+    value = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(value))
+    return " ".join(value.replace("】", "］").replace("]", "］").split())
+
+
+def display_address(p):
+    session, window_name = p.get("session"), p.get("window_name")
+    if session and window_name and p.get("window") is not None and p.get("pane") is not None:
+        return f"{label_text(session)}:{label_text(window_name)}({p['window']})-{p['pane']}"
+    return label_text(p.get("addr") or p["pane_id"])
+
+
 def label(p):
     if not p:
         return "unknown"
-    return "%s %s %s(%s)" % (p.get("kind") or "shell", p.get("name") or p["window_name"], p["addr"], p["pane_id"])
+    location = f"{p.get('kind') or 'shell'} {display_address(p)}({p['pane_id']})"
+    name = label_text(p.get("name") or "")
+    return f"{location} · {name}" if name else location
 
 
 def reply_line(p, tgt=None):
-    return 'ag send %s "…"   # %s %s @ tmux %s' % (tgt or p["pane_id"], p.get("kind") or "shell",
-                                                   p.get("name") or p["window_name"], p["addr"])
+    return f'ag send {tgt or p["pane_id"]} "…"   # {label(p)}'
 
 
 # ---------------------------------------------------------------- formatting
@@ -529,23 +603,68 @@ def cmd_ls(args):
     return 0
 
 
-def tmux_type(pane, msg):
-    """Type a message into a TUI input box and make sure it is submitted."""
-    probe = msg[:12]
-    sh(["tmux", "send-keys", "-t", pane, "-l", msg])
-    for i in range(4):
-        time.sleep(0.8)
-        sh(["tmux", "send-keys", "-t", pane, "Enter"])
-        time.sleep(1.5)
-        rc, out, _ = sh(["tmux", "capture-pane", "-p", "-t", pane])
-        tail = "\n".join([l for l in out.splitlines() if l.strip()][-6:])
-        if BUSY_RE.search(tail) or probe not in tail:
-            return 0, "submitted (try %d)" % (i + 1)
-    return 1, "message may still be in the input box"
+def checked_input(p):
+    """Recheck pane identity and read the current input box, if it is idle."""
+    pane = p["pane_id"]
+    fmt = "#{pane_id}\t#{pane_pid}\t#{pane_in_mode}\t#{pane_dead}\t#{pane_current_command}"
+    rc, out, _ = sh(["tmux", "display-message", "-p", "-t", pane, fmt])
+    expected = (pane, str(p["pane_pid"]), "0", "0", p["command"])
+    if rc or tuple(out.rstrip("\r\n").split("\t")) != expected:
+        return None
+    procs, kids = proc_table()
+    if find_agent(p["pane_pid"], procs, kids) != (p["kind"], p["agent_pid"]):
+        return None
+    rc, raw, _ = sh(["tmux", "capture-pane", "-e", "-p", "-J", "-t", pane])
+    if rc:
+        return None
+    busy, rows, _, waiting = inspect_ui(raw, p["kind"])
+    return None if busy or waiting else rows
+
+
+def echo_matches(rows, message):
+    """Check the complete input, accepting breaks made by the TUI's line wrapping."""
+    remaining = message.strip()
+    for row in rows:
+        text = ANSI.sub("", row).strip()
+        if not remaining.startswith(text):
+            return False
+        remaining = remaining[len(text):].lstrip(" ")
+    return not remaining
+
+
+def tmux_type(p, msg):
+    """Submit once, only after the complete typed message is in the input box."""
+    if any(unicodedata.category(ch) == "Cc" for ch in msg):
+        return 4, "message contains terminal control characters"
+    rows = checked_input(p)
+    if rows is None or any(map(visible_undimmed, rows)):
+        return 4, "idle empty input box could not be verified"
+    pane = p["pane_id"]
+    rc, _, _ = sh(["tmux", "send-keys", "-t", pane, "-l", msg])
+    if rc:
+        return rc, "input write uncertain; check the pane before retrying"
+    time.sleep(0.35)
+    rows = checked_input(p)
+    if rows is None or not echo_matches(rows, msg):
+        return 4, "typed input could not be verified; check the pane for a draft"
+    rc, _, _ = sh(["tmux", "send-keys", "-t", pane, "Enter"])
+    return (rc, "submit uncertain; check the pane before retrying") if rc else (0, "submitted to pane")
 
 
 def can_native_queue(p):
     return p["kind"] == "codex" and p.get("id") and p.get("id_source") in ("hook", "footer")
+
+
+def send_refusal(p):
+    if p.get("waiting"):
+        return "waiting-for-choice", "pane is waiting for a choice"
+    if p.get("draft"):
+        return "draft", "input box holds a draft"
+    if p.get("busy"):
+        return "busy", "pane is busy"
+    if p.get("draft") is not False or p["kind"] not in PROMPTS:
+        return "input-unknown", "idle empty input box could not be verified"
+    return None
 
 
 def cmd_send(args):
@@ -560,36 +679,39 @@ def cmd_send(args):
     if len(hit) != 1:
         print("target %s: %s" % ("ambiguous" if hit else "not found", target), file=sys.stderr)
         for p in hit[:12]:
-            print("  %s %s %s %s" % (p["pane_id"], p["kind"], p.get("name") or p["window_name"], short(p["cwd"])),
-                  file=sys.stderr)
+            print("  %s %s" % (label(p), short(p["cwd"])), file=sys.stderr)
         return 3
     p, src = hit[0], me(reg)
     if src and src["pane_id"] == p["pane_id"]:
         print("refused: the target is yourself", file=sys.stderr)
         return 3
-    body = "[ag from %s] %s" % (label(src), msg)
-    rec = {"ts": now_iso(), "from": label(src), "to": label(p), "to_id": p.get("id"),
+    sender, recipient = label(src), label(p)
+    body = "[ag from %s] %s" % (sender, msg)
+    rec = {"ts": now_iso(), "from": sender, "to": recipient, "to_id": p.get("id"),
            "sha256": hashlib.sha256(body.encode()).hexdigest(), "chars": len(body)}
+    queue = can_native_queue(p)
+    refusal = send_refusal(p) if not queue else None
     if dry:
-        how = "codex-queue" if can_native_queue(p) else "refused(draft)" if p.get("draft") else "tmux"
+        how = "codex-queue" if queue else f"refused({refusal[0]})" if refusal else "tmux"
         print("dry-run from=%s -> %s  id=%s(%s) state=%s method=%s" % (
-            label(src), label(p), p.get("id"), p.get("id_source"), state_of(p), how))
+            sender, recipient, p.get("id"), p.get("id_source"), state_of(p), how))
         return 0
-    if can_native_queue(p):
+    if queue:
         codex = CODEX_CFG.get("bin") or shutil.which("codex") or "codex"
         rc, out, err = sh([codex, "queue", "--thread", p["id"], "--message", body], timeout=60, env=codex_env())
         rec.update(method="codex-queue", rc=rc, detail=(out + err).strip().splitlines()[-1:])
-    elif p.get("draft"):
-        rec.update(method="refused", rc=4, detail=["input box holds a draft"])
-    elif p["kind"] == "codex" and p.get("busy"):
-        rec.update(method="refused", rc=4, detail=["codex thread unconfirmed (%s) and pane busy" % p.get("id_source")])
+    elif refusal:
+        rec.update(method="refused", rc=4, detail=[refusal[1]])
     else:
-        rc, detail = tmux_type(p["pane_id"], re.sub(r"\s*\n\s*", " ⏎ ", body))
+        rc, detail = tmux_type(p, re.sub(r"\s*\n\s*", " ⏎ ", body))
         rec.update(method="tmux", rc=rc, detail=[detail])
-    append_jsonl(SENT, rec)
+    try:
+        record_send(rec)
+    except OSError:
+        print("could not write the send receipt", file=sys.stderr)
     ok = rec["rc"] == 0
-    print("%s -> %s  [%s] %s" % ("delivered/queued" if ok else "NOT delivered", label(p), rec["method"],
-                                 " ".join(rec.get("detail") or [])))
+    print("%s %s -> %s  [%s] %s" % ("submitted/queued" if ok else "send unsuccessful", sender, recipient,
+                                    rec["method"], " ".join(rec.get("detail") or [])))
     return 0 if ok else 4
 
 

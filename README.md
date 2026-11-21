@@ -14,12 +14,12 @@ $ ag ls -t
 
 ## Why
 
-- **Cross-vendor messaging.** Claude Code and Codex can't talk to each other natively. `ag send codex-web "tests pass, please deploy"` routes to Codex through its own `codex queue` (never touches the input box) and to other agents by typing into their tmux pane.
-- **Safe by default.** Refuses to type into a pane whose input box holds your unsent draft; never sends Ctrl-C or Enter-spam to a busy agent; refuses ambiguous targets and lists candidates.
-- **"Who's waiting for me?"** Detects permission prompts / question dialogs (Claude, Codex, opencode) as `wait`, besides `draft`, `busy`, `idle`.
-- **Reply lines.** `prefix + a` copies `ag send %12 "…"   # claude api-refactor @ tmux api:1.2` — paste it into another agent and it knows how to report back.
+- **Cross-vendor messaging.** `ag send codex-web "tests pass"` uses `codex queue` for a verified Codex thread. When the receiving CLI has a recognizable idle input box, PanePost can also submit the message through tmux.
+- **Draft protection.** The tmux route stops at drafts, busy panes, choice menus and unknown input layouts. It checks the whole message in the input box before submitting once.
+- **"Who's waiting for me?"** Detects known permission prompts and question dialogs as `wait`, alongside `draft`, `busy` and `idle`.
+- **Readable reply lines.** `prefix + a` copies `ag send %12 "…"   # claude work:ops(1)-1(%12) · API review`. The window and pane are visible in the message header, the send receipt and the reply line.
 - **Reboot recovery.** Snapshots tmux layout plus each agent's session id; `ag restore --plan` prints the `tmux` + `claude --resume` / `codex resume` commands (it never runs them for you).
-- **No lock-in.** Plain tmux, a single stdlib-only Python file, metadata only (never reads conversation content or credentials).
+- **No lock-in.** Plain tmux and a stdlib-only Python CLI. PanePost uses the visible terminal layout and local session metadata to route messages.
 
 ## Install
 
@@ -64,13 +64,16 @@ ag scan [--quiet]                # refresh registry + snapshot (run it from cron
 
 | Agent | Detected by | Session id from | Delivery |
 |---|---|---|---|
-| Claude Code | process in the pane | `~/.claude/sessions/<pid>.json` | tmux typing (draft-safe) |
-| Codex CLI | process in the pane | hook log, else footer name ↔ `~/.codex/state_*.sqlite` (read-only) | `codex queue --thread` |
-| opencode / agy / cursor-agent / gemini | process in the pane | — | tmux typing |
+| Claude Code | process in the pane | `~/.claude/sessions/<pid>.json` | verified tmux input box |
+| Codex CLI | process in the pane | hook log, else footer name and directory ↔ `~/.codex/state_*.sqlite` (read-only) | `codex queue --thread`, or verified tmux input box |
+| agy / Antigravity | process in the pane | — | verified tmux input box |
+| opencode / cursor-agent / gemini | process in the pane | — | listing and navigation |
 
-Status comes from the bottom lines of `tmux capture-pane -e`: dim text after the prompt is a placeholder, normal text is a draft. These are **undocumented internals of each CLI** and may change with their releases — expect the occasional `?` (unconfirmed id) until fixed.
+The status parser uses the visible input box and footer in `tmux capture-pane -e`. These layouts can change between CLI releases. If PanePost cannot verify the text after typing, check the pane for a draft before trying again.
 
-State lives in `$XDG_STATE_HOME/panepost` (`~/.local/state/panepost`): `registry.json`, `snapshots/`, `sent.jsonl` (time, from, to, SHA-256 — no message text), `aliases.json`, `projects.json`.
+Use `ag send --dry-run %12 "example"` to see the source, destination and planned route. In `work:ops(1)-1(%12)`, `work` is the session, `ops` is window 1, and the final `1` is the pane index. You can address this pane as `%12`, `work:1.1` or `'work:ops(1)-1'` in a shell.
+
+State lives in `$XDG_STATE_HOME/panepost` (`~/.local/state/panepost`). The bounded `sent.jsonl` stores time, source, destination, SHA-256 and delivery status. Other files hold the registry, snapshots, aliases and projects.
 
 ## Configuration (optional)
 

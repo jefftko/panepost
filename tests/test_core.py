@@ -1,7 +1,12 @@
+import contextlib
+import io
+import json
 import os
 import sys
 import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 os.environ["PANEPOST_STATE"] = tempfile.mkdtemp(prefix="panepost-test-")
@@ -50,6 +55,26 @@ class ParseUI(unittest.TestCase):
     def test_opencode_allow_is_waiting(self):
         self.assertTrue(cli.parse_ui("  ┃   Allow once   Allow always   Reject\n", "opencode")[3])
 
+    def test_missing_prompt_does_not_report_empty_input(self):
+        self.assertIsNone(cli.parse_ui("output without an input box", "claude")[1])
+        self.assertIsNone(cli.parse_ui("❯ example from the conversation", "claude")[1])
+
+    def test_agy_cancel_hint_indicates_busy_without_a_menu(self):
+        busy, draft, _, waiting = cli.parse_ui("⠋ Thinking\nesc to cancel", "agy")
+        self.assertTrue(busy)
+        self.assertIsNone(draft)
+        self.assertFalse(waiting)
+
+    def test_agy_active_run_menu_is_waiting(self):
+        screen = "Run this command?\n> 1. Run once\n  4. Cancel\n↑/↓ Navigate\nesc to cancel"
+        busy, _, _, waiting = cli.parse_ui(screen, "agy")
+        self.assertFalse(busy)
+        self.assertTrue(waiting)
+
+    def test_agy_multiline_draft(self):
+        screen = "──────\n> \n  second line\n──────\nauto · model"
+        self.assertTrue(cli.parse_ui(screen, "agy")[1])
+
     def test_truecolor_codes_do_not_toggle_dim(self):
         # 38;2;r;g;b contains a literal "2" that must not be read as the dim attribute
         self.assertTrue(cli.visible_undimmed("\x1b[38;2;2;2;2mtext"))
@@ -76,11 +101,20 @@ class Targets(unittest.TestCase):
         reg = self._reg()
         self.assertEqual([p["pane_id"] for p in cli.resolve("%2", reg)], ["%2"])
         self.assertEqual([p["pane_id"] for p in cli.resolve("api:1.1", reg)], ["%3"])
+        self.assertEqual([p["pane_id"] for p in cli.resolve("api:win1(1)-1", reg)], ["%3"])
         self.assertEqual([p["pane_id"] for p in cli.resolve("cccccccc", reg)], ["%3"])
         self.assertEqual([p["pane_id"] for p in cli.resolve("web-a1", reg)], ["%1"])
         self.assertEqual(len(cli.resolve("site", reg)), 2)  # ambiguous substring -> caller refuses
         self.assertEqual(cli.resolve("nope", reg), [])
         self.assertEqual([p["pane_id"] for p in cli.resolve('ag send %3 "…"  # x', reg)], ["%3"])
+
+    def test_reply_line_shows_human_readable_location(self):
+        p = self._reg()["panes"][0]
+        p["name"] = "API review\npart [2]"
+        line = cli.reply_line(p)
+        self.assertEqual(line, 'ag send %1 "…"   # claude web:win1(1)-1(%1) · API review part [2］')
+        self.assertEqual(cli.normalize_target(line), "%1")
+        self.assertEqual(p["addr"], "web:1.1")
 
 
 class CodexFooter(unittest.TestCase):
@@ -99,6 +133,94 @@ class CodexFooter(unittest.TestCase):
     def test_ambiguous(self):
         t, src = cli.match_codex_footer("GPT · /w/… · Fix login · Main", "/x", self.T)
         self.assertEqual(src, "ambiguous")
+
+    def test_wrapped_path_and_label(self):
+        capture = "› \nGPT · /w/\nc · Write docs\nfor the API\n← for agents · ? for shortcuts"
+        footer = cli.parse_ui(capture, "codex")[2]
+        t, src = cli.match_codex_footer(footer, "/w/c", self.T)
+        self.assertEqual((t["id"], src), ("t3", "footer"))
+
+    def test_unique_title_at_different_directory_is_unconfirmed(self):
+        self.assertEqual(cli.match_codex_footer("GPT · /wrong · Write docs for the API", "/wrong", self.T),
+                         (None, "unknown"))
+
+    def test_directory_with_spaces_does_not_match_a_different_directory(self):
+        self.assertEqual(cli.match_codex_footer("GPT · /w/c · Write docs for the API", "/w/ c", self.T),
+                         (None, "unknown"))
+
+
+class Send(unittest.TestCase):
+    pane = {"pane_id": "%12", "pane_pid": 20, "kind": "claude", "agent_pid": 30, "command": "claude",
+            "draft": False, "busy": False, "waiting": False, "session": "work", "window_name": "ops",
+            "window": 1, "pane": 1, "addr": "work:1.1", "name": "API review"}
+
+    def test_native_queue_keeps_busy_draft_and_receipt_has_both_labels(self):
+        recipient = dict(self.pane, pane_id="%9", kind="codex", id="confirmed-thread", id_source="footer",
+                         busy=True, draft=True, pane=2, addr="work:1.2", name="fix login")
+        with patch.object(cli, "scan", return_value={"panes": [recipient]}), \
+                patch.object(cli, "me", return_value=self.pane), \
+                patch.object(cli, "sh", return_value=(0, "queued", "")) as send, \
+                patch.object(cli, "record_send") as log, contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(cli.cmd_send(["%9", "example"]), 0)
+        self.assertEqual(send.call_args.args[0][-1], "[ag from claude work:ops(1)-1(%12) · API review] example")
+        self.assertEqual(log.call_args.args[0]["to"], cli.label(recipient))
+        self.assertIn(cli.label(self.pane) + " -> " + cli.label(recipient), out.getvalue())
+
+    def test_dry_run_never_sends_and_shows_choice_refusal(self):
+        target = dict(self.pane, waiting=True)
+        with patch.object(cli, "scan", return_value={"panes": [target]}), \
+                patch.object(cli, "me", return_value=None), \
+                patch.object(cli, "sh") as send, patch.object(cli, "record_send") as log, \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(cli.cmd_send(["--dry-run", "%12", "example"]), 0)
+        self.assertIn("method=refused(waiting-for-choice)", out.getvalue())
+        send.assert_not_called()
+        log.assert_not_called()
+
+    def test_tty_send_checks_the_whole_wrapped_draft_then_submits_once(self):
+        with patch.object(cli, "checked_input", side_effect=[[" "], [" full", "  message"]]), \
+                patch.object(cli, "sh", return_value=(0, "", "")) as send, patch.object(cli.time, "sleep"):
+            self.assertEqual(cli.tmux_type(self.pane, "full message"), (0, "submitted to pane"))
+        self.assertEqual([call.args[0][-1] for call in send.call_args_list], ["full message", "Enter"])
+
+    def test_tty_refuses_without_keys_if_idle_empty_box_is_unverified(self):
+        for rows in (None, [" existing draft"]):
+            with self.subTest(rows=rows), patch.object(cli, "checked_input", return_value=rows), \
+                    patch.object(cli, "sh") as send:
+                self.assertEqual(cli.tmux_type(self.pane, "message")[0], 4)
+            send.assert_not_called()
+
+    def test_tty_never_submits_when_modal_or_changed_draft_is_seen(self):
+        for rows in (None, [" full message from another sender"], [" unrelated"]):
+            with self.subTest(rows=rows), patch.object(cli, "checked_input", side_effect=[[" "], rows]), \
+                    patch.object(cli, "sh", return_value=(0, "", "")) as send, patch.object(cli.time, "sleep"):
+                self.assertEqual(cli.tmux_type(self.pane, "full message")[0], 4)
+            send.assert_called_once_with(["tmux", "send-keys", "-t", "%12", "-l", "full message"])
+
+    def test_tty_rejects_control_characters_without_keys(self):
+        with patch.object(cli, "checked_input") as check, patch.object(cli, "sh") as send:
+            self.assertEqual(cli.tmux_type(self.pane, "text\x1b\x03")[0], 4)
+        check.assert_not_called()
+        send.assert_not_called()
+
+    def test_copy_mode_or_different_agent_stops_before_capture(self):
+        for mode, agent in (("1", ("claude", 30)), ("0", ("claude", 31))):
+            with self.subTest(mode=mode, agent=agent), patch.object(cli, "sh", return_value=(
+                    0, f"%12\t20\t{mode}\t0\tclaude\n", "")) as command, \
+                    patch.object(cli, "proc_table", return_value=({}, {})), patch.object(cli, "find_agent", return_value=agent):
+                self.assertIsNone(cli.checked_input(self.pane))
+            self.assertEqual(command.call_count, 1)
+
+    def test_record_retains_valid_recent_lines_at_size_limit(self):
+        sent = Path(os.environ["PANEPOST_STATE"]) / "rotation-test.jsonl"
+        with patch.object(cli, "SENT", str(sent)), patch.object(cli, "SENT_MAX_BYTES", 128), \
+                patch.object(cli, "SENT_KEEP_LINES", 3):
+            for index in range(20):
+                cli.record_send({"index": index, "label": "示例 work:ops(1)-1"})
+        self.assertLessEqual(sent.stat().st_size, 128)
+        records = [json.loads(line) for line in sent.read_bytes().splitlines()]
+        self.assertEqual(records[-1]["index"], 19)
+        self.assertLessEqual(len(records), 3)
 
 
 class Restore(unittest.TestCase):

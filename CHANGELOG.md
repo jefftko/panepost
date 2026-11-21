@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Show the tmux session, window name, indexes and pane ID alongside the agent name in send headers, send receipts and reply lines.
+- Identify named Codex threads from wrapped footers when the title and directory match.
+- Check for an idle empty input box before typing through tmux. Confirm the full input before submitting once.
+- Bound the send receipt log to 8 MiB and retain up to 20,000 recent records on rotation.
+
 ## 0.0.1 — 2026-11-08
 
 First public release.
