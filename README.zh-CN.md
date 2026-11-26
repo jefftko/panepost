@@ -3,6 +3,7 @@
 在 tmux 里同时跑 Claude Code、Codex、opencode 等多个 AI Agent 时，`ag` 能：
 
 - **一眼看全**：`ag ls` 列出所有 Agent 及状态。状态分四种：等你（停在批准框或提问框）、草稿（输入框里有没发出的字）、忙、闲。
+- **定位**：`ag where <目标>` 只读输出具名位置及可直接粘贴的跳转指令。
 - **按名字互发消息**：`ag send <名字> "内容"`。
   - 已确认会话的 Codex 使用原生 `codex queue`；
   - tmux 发给 Claude Code、Codex 或 agy 前先确认输入框空闲且无草稿，完整核对输入后提交一次。遇到忙碌、选项菜单或无法辨认的界面会停下；

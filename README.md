@@ -10,7 +10,9 @@ $ ag ls -t
   1h  idle  claude   9d0e4b11  web:1.1            web-c4                         ~/code/web
 ```
 
-> Status: **0.0.1**, early. Tested on macOS + tmux 3.6 with Claude Code and Codex CLI. Linux should work for the CLI (untested).
+> Status: **0.0.2**, early. Tested on macOS + tmux 3.6 with Claude Code and Codex CLI.
+
+Use `ag where <target>` to print a readable location and a copyable `ag go` command without moving focus.
 
 ## Why
 

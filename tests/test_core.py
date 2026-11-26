@@ -30,6 +30,14 @@ CODEX_BUSY = "• Working (2s • esc to interrupt)\n› " + DIM + "Ask Codex to
 
 
 class ParseUI(unittest.TestCase):
+    def test_agy_auto_hint_is_empty_and_other_text_is_a_draft(self):
+        hint = cli.AGY_AUTO_HINT
+        for text in (hint, DIM + hint + RST, hint.split("+tab")[0]):
+            raw = "────\n> " + text + "\n────\n"
+            self.assertFalse(cli.parse_ui(raw, "agy")[1])
+        raw = "────\n> " + hint + " actual draft\n────\n"
+        self.assertTrue(cli.parse_ui(raw, "agy")[1])
+
     def test_codex_placeholder_is_not_draft(self):
         busy, draft, footer, waiting = cli.parse_ui(CODEX_IDLE, "codex")
         self.assertFalse(busy)
@@ -115,6 +123,21 @@ class Targets(unittest.TestCase):
         self.assertEqual(line, 'ag send %1 "…"   # claude web:win1(1)-1(%1) · API review part [2］')
         self.assertEqual(cli.normalize_target(line), "%1")
         self.assertEqual(p["addr"], "web:1.1")
+
+
+class Where(unittest.TestCase):
+    def test_where_quotes_the_live_navigation_target_without_jumping(self):
+        pane = dict(kind="agy", pane_id="%9", addr="demo:2.1", session="demo", pane=1,
+                    window=2, window_name="owner's window", name="Example agent", cwd="/example")
+        out = io.StringIO()
+        with (patch.object(cli, "scan", return_value={"panes": [pane]}),
+              patch.object(cli, "load_json", return_value={}),
+              patch.object(cli, "go_pane") as jump, contextlib.redirect_stdout(out)):
+            self.assertEqual(cli.main(["where", "%9"]), 0)
+            jump.assert_not_called()
+        self.assertIn("demo:owner's window(2)-1(%9) · Example agent", out.getvalue())
+        self.assertEqual(cli.shlex.split(out.getvalue().splitlines()[1]),
+                         ["ag", "go", "demo:owner's window(2)-1"])
 
 
 class CodexFooter(unittest.TestCase):

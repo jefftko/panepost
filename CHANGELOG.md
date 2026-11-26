@@ -1,11 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.0.2 — 2026-11-27
 
 - Show the tmux session, window name, indexes and pane ID alongside the agent name in send headers, send receipts and reply lines.
 - Identify named Codex threads from wrapped footers when the title and directory match.
 - Check for an idle empty input box before typing through tmux. Confirm the full input before submitting once.
 - Bound the send receipt log to 8 MiB and retain up to 20,000 recent records on rotation.
+- Add read-only pane lookup with `ag where` and a shell-quoted jump command.
+- Recognize the agy Auto mode hint while guarding real drafts and approval dialogs.
+- Store a status summary for native queue receipts without persisting queue output.
 
 ## 0.0.1 — 2026-11-08
 

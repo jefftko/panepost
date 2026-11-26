@@ -6,6 +6,7 @@
                                  others via tmux when the idle input box can be verified
   ag me [--pane %N] [--copy]     this pane's reply line:  ag send %12 "…"   # claude work:api(1)-2(%12) · API review
   ag cp <target> [send|id|pane|addr|resume|cwd|name]   copy to clipboard (default: send line)
+  ag where <target>              show the pane and a pasteable navigation command
   ag go <target>                 select that pane (and raise its terminal window when possible)
   ag new <dir> [--agent claude|codex|shell] [--session S] [--name N] [--go]
                                  start an agent in a directory (new tmux window / session)
@@ -69,6 +70,7 @@ BOX_RULE = re.compile(r"[─━]{3,}")
 AGY_MENU = re.compile(r"^\s*(?:Run this command\?|Allow access to this file\?|Requested Permission \(Editable\))\s*$|"
                       r"^\s*(?:↑/↓[ \t]+Navigate|enter confirm[ \t]+·[ \t]+esc back).*?$", re.M)
 AGY_BUSY = re.compile(r"\besc to cancel\b|[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣻]\s*(?:Running|Thinking|Working)", re.I)
+AGY_AUTO_HINT = "Auto mode: edits & safe commands auto-approved (shift+tab to cycle)"
 SEP = "\t"
 CODEX_CFG = CFG.get("codex", {}) if isinstance(CFG.get("codex"), dict) else {}
 AGENT_CMDS = {"claude": "claude", "codex": "codex"}
@@ -229,7 +231,15 @@ def input_rows(lines, plain, kind):
         for end in range(i + 1, len(plain)):
             if BOX_RULE.fullmatch(plain[end].strip()) or (kind == "codex" and footer_start(plain[end])):
                 first = lines[i].partition(marker)[2]
-                return [first, *lines[i+1:end]]
+                rows = [first, *lines[i+1:end]]
+                if kind == "agy" and len(rows) == 1:
+                    hint = ANSI.sub("", first).strip()
+                    if hint == AGY_AUTO_HINT or (
+                        hint.startswith("Auto mode: edits & safe commands auto-approved (shift")
+                        and AGY_AUTO_HINT.startswith(hint)
+                    ):
+                        return []
+                return rows
         return None
     return None
 
@@ -698,8 +708,9 @@ def cmd_send(args):
         return 0
     if queue:
         codex = CODEX_CFG.get("bin") or shutil.which("codex") or "codex"
-        rc, out, err = sh([codex, "queue", "--thread", p["id"], "--message", body], timeout=60, env=codex_env())
-        rec.update(method="codex-queue", rc=rc, detail=(out + err).strip().splitlines()[-1:])
+        rc, _, _ = sh([codex, "queue", "--thread", p["id"], "--message", body], timeout=60, env=codex_env())
+        rec.update(method="codex-queue", rc=rc, detail=[
+            "accepted by the native queue" if rc == 0 else "native queue unsuccessful; check the original thread"])
     elif refusal:
         rec.update(method="refused", rc=4, detail=[refusal[1]])
     else:
@@ -769,6 +780,27 @@ def cmd_go(args):
         return 3
     print(go_pane(hit[0]))
     return 0
+
+
+def cmd_where(args):
+    if len(args) != 1 or not args[0].strip():
+        print("usage: ag where <target>", file=sys.stderr)
+        return 2
+    reg = scan()
+    hit = resolve(args[0], reg)
+    if len(hit) != 1:
+        print("target %s: %s" % ("ambiguous" if hit else "not found", label_text(args[0])), file=sys.stderr)
+        for candidate in hit[:12]:
+            print("  " + label(candidate), file=sys.stderr)
+        return 3
+    pane = hit[0]
+    for target in (display_address(pane), pane["addr"]):
+        if resolve(target, reg) == [pane]:
+            print(label(pane))
+            print("ag go " + shlex.quote(target))
+            return 0
+    print("no unique navigation target: " + label(pane), file=sys.stderr)
+    return 3
 
 
 SAFE_NAME = re.compile(r"[^A-Za-z0-9_\-一-鿿]+")
@@ -1168,7 +1200,7 @@ def cmd_codex_hook_snippet(args):
     return 0
 
 
-COMMANDS = {"ls": cmd_ls, "send": cmd_send, "go": cmd_go, "pick": cmd_pick, "scan": cmd_scan,
+COMMANDS = {"ls": cmd_ls, "send": cmd_send, "go": cmd_go, "where": cmd_where, "pick": cmd_pick, "scan": cmd_scan,
             "restore": cmd_restore, "alias": cmd_alias, "hook": cmd_hook, "new": cmd_new,
             "projects": cmd_projects, "pick-new": cmd_pick_new, "pin": cmd_pin, "cp": cmd_cp, "me": cmd_me,
             "tmux-snippet": cmd_tmux_snippet, "codex-hook-snippet": cmd_codex_hook_snippet}
