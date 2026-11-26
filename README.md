@@ -52,6 +52,7 @@ ag ls [filter] [-t] [--json]     # grouped by tmux session; -t = flat, most rece
 ag send [--dry-run] <target> <message>
 ag me [--copy]                   # your reply line
 ag cp <target> [send|id|pane|addr|resume|cwd|name]
+ag where <target>                # show the pane and a pasteable jump command
 ag go <target>                   # select pane (raises the Ghostty window on macOS)
 ag new <dir> [--agent claude|codex|shell] [--session S] [--name N] [--go]
 ag projects [-n N] / ag pin [--rm] <dir>
@@ -71,7 +72,7 @@ ag scan [--quiet]                # refresh registry + snapshot (run it from cron
 | agy / Antigravity | process in the pane | — | verified tmux input box |
 | opencode / cursor-agent / gemini | process in the pane | — | listing and navigation |
 
-The status parser uses the visible input box and footer in `tmux capture-pane -e`. These layouts can change between CLI releases. If PanePost cannot verify the text after typing, check the pane for a draft before trying again.
+The status parser uses the visible input box and footer in `tmux capture-pane -e`. These layouts can change between CLI releases. If delivery is uncertain, check the pane before retrying. PanePost may have left text in the input box.
 
 Use `ag send --dry-run %12 "example"` to see the source, destination and planned route. In `work:ops(1)-1(%12)`, `work` is the session, `ops` is window 1, and the final `1` is the pane index. You can address this pane as `%12`, `work:1.1` or `'work:ops(1)-1'` in a shell.
 

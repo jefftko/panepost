@@ -23,7 +23,7 @@
 
 Targets: alias, %pane, session:window[.pane], session:window_name(index)-pane, session-id prefix (>=8), agent name, window name,
 or a unique substring. A pasted `ag send X "…"  # …` line works as a target too.
-Metadata only: never reads conversation content or credentials.
+Uses the visible terminal layout and local agent session metadata.
 """
 import datetime, fcntl, glob, hashlib, json, os, platform, re, shlex, shutil, sqlite3, subprocess, sys, time, unicodedata
 
@@ -70,7 +70,6 @@ BOX_RULE = re.compile(r"[─━]{3,}")
 AGY_MENU = re.compile(r"^\s*(?:Run this command\?|Allow access to this file\?|Requested Permission \(Editable\))\s*$|"
                       r"^\s*(?:↑/↓[ \t]+Navigate|enter confirm[ \t]+·[ \t]+esc back).*?$", re.M)
 AGY_BUSY = re.compile(r"\besc to cancel\b|[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣻]\s*(?:Running|Thinking|Working)", re.I)
-AGY_AUTO_HINT = "Auto mode: edits & safe commands auto-approved (shift+tab to cycle)"
 SEP = "\t"
 CODEX_CFG = CFG.get("codex", {}) if isinstance(CFG.get("codex"), dict) else {}
 AGENT_CMDS = {"claude": "claude", "codex": "codex"}
@@ -128,7 +127,7 @@ def record_send(obj):
         if os.path.getsize(SENT) <= SENT_MAX_BYTES:
             return
         with open(SENT, "rb") as f:
-            f.seek(-SENT_MAX_BYTES, os.SEEK_END)
+            f.seek(-(SENT_MAX_BYTES // 2), os.SEEK_END)
             f.readline()
             lines = f.readlines()[-SENT_KEEP_LINES:]
         tmp = "%s.tmp.%d" % (SENT, os.getpid())
@@ -217,8 +216,8 @@ def footer_start(line):
     return " · " in line and ("~/" in line or " /" in line)
 
 
-def input_rows(lines, plain, kind):
-    """Return visible input rows only when the prompt and its box can be located."""
+def input_box(lines, plain, kind, footer_index):
+    """Return the bounds and content of a recognizable input box."""
     marker = PROMPTS.get(kind)
     if marker is None:
         return None
@@ -229,17 +228,9 @@ def input_rows(lines, plain, kind):
         if kind in ("claude", "agy") and (i == 0 or not BOX_RULE.fullmatch(plain[i-1].strip())):
             return None
         for end in range(i + 1, len(plain)):
-            if BOX_RULE.fullmatch(plain[end].strip()) or (kind == "codex" and footer_start(plain[end])):
+            if BOX_RULE.fullmatch(plain[end].strip()) or end == footer_index:
                 first = lines[i].partition(marker)[2]
-                rows = [first, *lines[i+1:end]]
-                if kind == "agy" and len(rows) == 1:
-                    hint = ANSI.sub("", first).strip()
-                    if hint == AGY_AUTO_HINT or (
-                        hint.startswith("Auto mode: edits & safe commands auto-approved (shift")
-                        and AGY_AUTO_HINT.startswith(hint)
-                    ):
-                        return []
-                return rows
+                return i, end, [first, *lines[i+1:end]]
         return None
     return None
 
@@ -247,20 +238,27 @@ def input_rows(lines, plain, kind):
 def inspect_ui(raw, kind):
     lines = [line for line in raw.splitlines() if ANSI.sub("", line).strip()][-24:]
     plain = [ANSI.sub("", line) for line in lines]
-    tail = "\n".join(plain[-10:])
-    waiting = bool(AGY_MENU.search(tail) if kind == "agy" else WAIT_RE.search(tail))
-    busy = bool(BUSY_RE.search(tail) or (kind == "agy" and not waiting and AGY_BUSY.search(tail)))
-    rows = input_rows(lines, plain, kind)
     footer = ""
+    footer_index = None
     if kind == "codex":
         for i in range(len(plain) - 1, -1, -1):
             if footer_start(plain[i]):
+                footer_index = i
                 footer = plain[i].strip()
                 for continuation in plain[i+1:i+3]:
                     if continuation.lstrip().startswith(("← for agents", "? for shortcuts")):
                         break
                     footer += continuation.strip()
                 break
+    box = input_box(lines, plain, kind, footer_index)
+    rows = None
+    status_lines = plain
+    if box is not None:
+        start, end, rows = box
+        status_lines = plain[:start] + plain[end:]
+    tail = "\n".join(status_lines[-10:])
+    waiting = bool(AGY_MENU.search(tail) if kind == "agy" else WAIT_RE.search(tail))
+    busy = bool(BUSY_RE.search(tail) or (kind == "agy" and not waiting and AGY_BUSY.search(tail)))
     return busy, rows, footer, waiting
 
 
@@ -477,6 +475,12 @@ def resolve(target, reg, depth=0):
     al = load_json(ALIASES, {})
     if target in al and depth == 0:
         return resolve(al[target], reg, 1)
+    # A copied reply line may outlive its tmux server. Bind its pane ID to the
+    # recorded location so a reused numeric ID alone cannot select a recipient.
+    pasted = re.match(r'^\s*ag send\s+(%\d+)\s+.*?\s+# \S+ (.+?)\((%\d+)\)(?: · .*|\s*)$', target)
+    if pasted:
+        pane_id, location, labeled_id = pasted.groups()
+        return [p for p in ags if p["pane_id"] == pane_id == labeled_id and display_address(p) == location]
     target = normalize_target(target)
     t = target.lower()
     tests = [
@@ -613,8 +617,8 @@ def cmd_ls(args):
     return 0
 
 
-def checked_input(p):
-    """Recheck pane identity and read the current input box, if it is idle."""
+def checked_input(p, allow_busy=False):
+    """Read the current input box after confirming the original pane identity."""
     pane = p["pane_id"]
     fmt = "#{pane_id}\t#{pane_pid}\t#{pane_in_mode}\t#{pane_dead}\t#{pane_current_command}"
     rc, out, _ = sh(["tmux", "display-message", "-p", "-t", pane, fmt])
@@ -628,18 +632,18 @@ def checked_input(p):
     if rc:
         return None
     busy, rows, _, waiting = inspect_ui(raw, p["kind"])
-    return None if busy or waiting else rows
+    return None if waiting or (busy and not allow_busy) else rows
 
 
-def echo_matches(rows, message):
-    """Check the complete input, accepting breaks made by the TUI's line wrapping."""
+def echo_remaining(rows, message):
+    """Return unrendered text, or None for a conflicting input box."""
     remaining = message.strip()
     for row in rows:
         text = ANSI.sub("", row).strip()
         if not remaining.startswith(text):
-            return False
+            return None
         remaining = remaining[len(text):].lstrip(" ")
-    return not remaining
+    return remaining
 
 
 def tmux_type(p, msg):
@@ -650,15 +654,28 @@ def tmux_type(p, msg):
     if rows is None or any(map(visible_undimmed, rows)):
         return 4, "idle empty input box could not be verified"
     pane = p["pane_id"]
-    rc, _, _ = sh(["tmux", "send-keys", "-t", pane, "-l", msg])
+    literal = msg[:-1] + "\\;" if msg.endswith(";") else msg
+    rc, _, _ = sh(["tmux", "send-keys", "-t", pane, "-l", literal])
     if rc:
         return rc, "input write uncertain; check the pane before retrying"
-    time.sleep(0.35)
-    rows = checked_input(p)
-    if rows is None or not echo_matches(rows, msg):
-        return 4, "typed input could not be verified; check the pane for a draft"
+    for _ in range(12):
+        time.sleep(0.1)
+        rows = checked_input(p)
+        remaining = echo_remaining(rows, msg) if rows is not None else None
+        if remaining == "":
+            break
+        if remaining is None:
+            return 4, "send stopped; PanePost may have left text in the input box"
+    else:
+        return 4, "send stopped; PanePost may have left text in the input box"
     rc, _, _ = sh(["tmux", "send-keys", "-t", pane, "Enter"])
-    return (rc, "submit uncertain; check the pane before retrying") if rc else (0, "submitted to pane")
+    if rc == 0:
+        for _ in range(12):
+            time.sleep(0.1)
+            rows = checked_input(p, allow_busy=True)
+            if rows is not None and not any(map(visible_undimmed, rows)):
+                return 0, "submitted to pane"
+    return 4, "submit uncertain; check whether PanePost left a draft before retrying"
 
 
 def can_native_queue(p):

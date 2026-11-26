@@ -31,12 +31,18 @@ CODEX_BUSY = "• Working (2s • esc to interrupt)\n› " + DIM + "Ask Codex to
 
 class ParseUI(unittest.TestCase):
     def test_agy_auto_hint_is_empty_and_other_text_is_a_draft(self):
-        hint = cli.AGY_AUTO_HINT
-        for text in (hint, DIM + hint + RST, hint.split("+tab")[0]):
-            raw = "────\n> " + text + "\n────\n"
-            self.assertFalse(cli.parse_ui(raw, "agy")[1])
-        raw = "────\n> " + hint + " actual draft\n────\n"
-        self.assertTrue(cli.parse_ui(raw, "agy")[1])
+        hint = "Auto mode: edits & safe commands auto-approved (shift+tab to cycle)"
+        for text in (hint, hint.split("+tab")[0]):
+            self.assertFalse(cli.parse_ui("────\n> " + DIM + text + RST + "\n────\n", "agy")[1])
+            self.assertTrue(cli.parse_ui("────\n> " + text + "\n────\n", "agy")[1])
+
+    def test_status_words_inside_input_are_only_draft_text(self):
+        raw = "────\n❯ Explain Esc to cancel and Working (2s)\n────\n"
+        self.assertEqual(cli.parse_ui(raw, "claude"), (False, True, "", False))
+
+    def test_codex_draft_continues_until_the_actual_footer(self):
+        raw = CODEX_IDLE.replace(DIM + "Ask Codex to do anything" + RST, "\n  notes · ~/work/demo")
+        self.assertTrue(cli.parse_ui(raw, "codex")[1])
 
     def test_codex_placeholder_is_not_draft(self):
         busy, draft, footer, waiting = cli.parse_ui(CODEX_IDLE, "codex")
@@ -108,6 +114,13 @@ class Targets(unittest.TestCase):
     def test_resolve_kinds(self):
         reg = self._reg()
         self.assertEqual([p["pane_id"] for p in cli.resolve("%2", reg)], ["%2"])
+
+    def test_pasted_reply_line_refuses_a_reused_pane_at_a_different_location(self):
+        reg = self._reg()
+        pane = reg["panes"][0]
+        line = cli.reply_line(pane)
+        self.assertEqual(cli.resolve(line, reg), [pane])
+        self.assertEqual(cli.resolve(line, {"panes": [dict(pane, window_name="different")]}), [])
         self.assertEqual([p["pane_id"] for p in cli.resolve("api:1.1", reg)], ["%3"])
         self.assertEqual([p["pane_id"] for p in cli.resolve("api:win1(1)-1", reg)], ["%3"])
         self.assertEqual([p["pane_id"] for p in cli.resolve("cccccccc", reg)], ["%3"])
@@ -201,10 +214,19 @@ class Send(unittest.TestCase):
         log.assert_not_called()
 
     def test_tty_send_checks_the_whole_wrapped_draft_then_submits_once(self):
-        with patch.object(cli, "checked_input", side_effect=[[" "], [" full", "  message"]]), \
+        with patch.object(cli, "checked_input", side_effect=[
+                [" "], [" full"], [" full", "  message;"], [" "]]), \
                 patch.object(cli, "sh", return_value=(0, "", "")) as send, patch.object(cli.time, "sleep"):
-            self.assertEqual(cli.tmux_type(self.pane, "full message"), (0, "submitted to pane"))
-        self.assertEqual([call.args[0][-1] for call in send.call_args_list], ["full message", "Enter"])
+            self.assertEqual(cli.tmux_type(self.pane, "full message;"), (0, "submitted to pane"))
+        self.assertEqual([call.args[0][-1] for call in send.call_args_list], ["full message\\;", "Enter"])
+
+    def test_tty_reports_uncertain_submit_when_enter_leaves_a_draft(self):
+        with patch.object(cli, "checked_input", side_effect=[[""], ["draft"]] + [["edited draft"]] * 12), \
+                patch.object(cli, "sh", return_value=(0, "", "")) as send, patch.object(cli.time, "sleep"):
+            rc, message = cli.tmux_type(self.pane, "draft")
+        self.assertEqual(rc, 4)
+        self.assertIn("submit uncertain", message)
+        self.assertEqual([call.args[0][-1] for call in send.call_args_list], ["draft", "Enter"])
 
     def test_tty_refuses_without_keys_if_idle_empty_box_is_unverified(self):
         for rows in (None, [" existing draft"]):
